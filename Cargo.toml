@@ -1,0 +1,32 @@
+[package]
+name = "flib_rs"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+bincode = "1.3.3"
+partialzip = "5.0.0"
+pyo3 = { version = "0.22.3", features = ["extension-module"] }
+serde = { version = "1.0.210", features = ["derive"] }
+tantivy = "0.19"
+url = "2.5.2"
+zip = "2.2.0"
+
+[lib]
+name = "flib_rs"
+crate-type = ["cdylib"]
+[build-system]
+requires = ["maturin"]
+build-backend = "maturin"
+
+[project]
+name = "flib_rs"
+version = "0.1.0"
+authors = ["krakotay@yandex.ru"]
+description = "Python обертка для поиска книг на Rust с использованием Tantivy"
+readme = "README.md"
+license = "MIT"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+]
