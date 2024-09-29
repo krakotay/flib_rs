@@ -1,7 +1,5 @@
 use partialzip::PartialZip;
-use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs::{self, File};
@@ -10,11 +8,10 @@ use std::path::{Path, PathBuf};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::*;
+use tantivy::Document as TantivyDocument;
 use tantivy::{Index, TantivyError};
 use url::Url;
-use zip::ZipArchive; // Добавляем зависимость на crate `url`
-                     // Явный импорт Document с псевдонимом, чтобы избежать конфликтов
-use tantivy::Document as TantivyDocument;
+use zip::ZipArchive;
 
 /// Структура для хранения информации о книге
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -22,8 +19,7 @@ struct Book {
     id: u64, // Изменено на u64 для соответствия Tantivy
     author_name: String,
     book_title: String,
-    zip_archive: String,        // Относительный путь к zip-архиву
-    internal_file_name: String, // Имя файла внутри zip-архива
+    zip_archive: String, // Относительный путь к zip-архиву
 }
 
 /// Создание схемы для Tantivy с добавленными полями `id`, `zip_archive` и `internal_file_name`
@@ -33,7 +29,6 @@ fn create_schema() -> Schema {
     schema_builder.add_text_field("author", TEXT | FAST | STORED);
     schema_builder.add_text_field("title", TEXT | FAST | STORED);
     schema_builder.add_text_field("zip_archive", TEXT | STORED); // Поле `zip_archive`
-    schema_builder.add_text_field("internal_file_name", TEXT | STORED); // Поле `internal_file_name`
     schema_builder.build()
 }
 
@@ -65,7 +60,6 @@ fn build_tantivy_index<P: AsRef<Path>>(
     let author_field = schema.get_field("author").unwrap();
     let title_field = schema.get_field("title").unwrap();
     let zip_archive_field = schema.get_field("zip_archive").unwrap();
-    let internal_file_name_field = schema.get_field("internal_file_name").unwrap();
     let mut writer = index.writer(50_000_000)?; // 50 MB
 
     let file = File::open(&inpx_path).map_err(|e| {
@@ -162,18 +156,12 @@ fn build_tantivy_index<P: AsRef<Path>>(
                     continue;
                 }
 
-                // Предполагаем, что имя файла внутри zip-архива соответствует имени zip-архива с расширением .fb2
-                // Например, для zip-архива "d.fb2-009373-367300.zip" внутренний файл будет "d.fb2-009373-367300.fb2"
-                let internal_file_name =
-                    zip_file_name.trim_end_matches(".zip").to_string() + ".fb2";
-
                 // Создаём структуру Book с полями `id`, `author_name`, `book_title`, `zip_archive` и `internal_file_name`
                 books.push(Book {
                     id,
                     author_name: fields[0].to_string(),
                     book_title: fields[2].to_string(),
                     zip_archive: zip_archive_path,
-                    internal_file_name,
                 });
             } else {
                 println!("Недостаточно полей в строке: '{}'", line);
@@ -190,7 +178,6 @@ fn build_tantivy_index<P: AsRef<Path>>(
         doc.add_text(author_field, &book.author_name);
         doc.add_text(title_field, &book.book_title);
         doc.add_text(zip_archive_field, &book.zip_archive); // Добавляем `zip_archive`
-        doc.add_text(internal_file_name_field, &book.internal_file_name); // Добавляем `internal_file_name`
         writer.add_document(doc)?;
     }
 
@@ -246,7 +233,51 @@ fn search_tantivy(
 
     Ok(results)
 }
+fn get_info(index_path: &str, id: u64) -> Result<(String, String), Box<dyn Error>> {
+    println!("Пытаемся скачать книгу с ID: {}", id);
+    println!("Путь к индексу: {}", index_path);
 
+    // Открываем индекс Tantivy
+    let index = Index::open_in_dir(index_path)
+        .map_err(|e| format!("Не удалось открыть индекс в '{}': {}", index_path, e))?;
+
+    // Создаём ридер и поисковик
+    let reader = index
+        .reader()
+        .map_err(|e| format!("Не удалось создать ридер для индекса: {}", e))?;
+    let searcher = reader.searcher();
+
+    let schema = index.schema();
+
+    // Получаем поля из схемы
+    let id_field = schema
+        .get_field("id")
+        .ok_or("Поле 'id' не найдено в схеме индекса")?;
+    let title = schema
+        .get_field("title")
+        .ok_or("Поле 'zip_archive' не найдено в схеме индекса")?;
+    let author = schema
+        .get_field("author")
+        .ok_or("Поле 'zip_archive' не найдено в схеме индекса")?;
+
+    // Создаём запрос для конкретного `id` с использованием `Basic` опции
+    let query = tantivy::query::TermQuery::new(
+        tantivy::Term::from_field_u64(id_field, id),
+        IndexRecordOption::Basic,
+    );
+
+    // Выполняем поиск
+    let addr = searcher
+        .search(&query, &TopDocs::with_limit(1))
+        .map_err(|e| format!("Ошибка при поиске ID {}: {}", id, e))?
+        .first()
+        .ok_or("С индексом проблемы!")?
+        .1;
+    let retrieved_doc = searcher.doc(addr)?;
+    let title_str = retrieved_doc.get_first(title).and_then(|v| v.as_text()).ok_or("Поле 'title' отсутствует в документе")?.to_string();
+    let author_str = retrieved_doc.get_first(author).and_then(|v| v.as_text()).ok_or("Поле 'title' отсутствует в документе")?.to_string();
+    Ok((title_str, author_str))
+}
 /// Функция для скачивания книги по `id` с подробными сообщениями об ошибках
 fn download_file(index_path: &str, id: u64) -> Result<bool, Box<dyn Error>> {
     println!("Пытаемся скачать книгу с ID: {}", id);
@@ -271,9 +302,9 @@ fn download_file(index_path: &str, id: u64) -> Result<bool, Box<dyn Error>> {
     let zip_archive_field = schema
         .get_field("zip_archive")
         .ok_or("Поле 'zip_archive' не найдено в схеме индекса")?;
-    let internal_file_name_field = schema
-        .get_field("internal_file_name")
-        .ok_or("Поле 'internal_file_name' не найдено в схеме индекса")?;
+    // let internal_file_name_field = schema
+    //     .get_field("internal_file_name")
+    //     .ok_or("Поле 'internal_file_name' не найдено в схеме индекса")?;
 
     // Создаём запрос для конкретного `id` с использованием `Basic` опции
     let query = tantivy::query::TermQuery::new(
@@ -406,9 +437,9 @@ fn get_file_bytes(index_path: &str, id: u64) -> Result<Vec<u8>, Box<dyn Error>> 
     let zip_archive_field = schema
         .get_field("zip_archive")
         .ok_or("Поле 'zip_archive' не найдено в схеме индекса")?;
-    let internal_file_name_field = schema
-        .get_field("internal_file_name")
-        .ok_or("Поле 'internal_file_name' не найдено в схеме индекса")?;
+    // let internal_file_name_field = schema
+    //     .get_field("internal_file_name")
+    //     .ok_or("Поле 'internal_file_name' не найдено в схеме индекса")?;
 
     // Создаём запрос для конкретного `id` с использованием `Basic` опции
     let query = tantivy::query::TermQuery::new(
@@ -538,8 +569,10 @@ impl FlibRS {
         get_file_bytes(&self.index_path, id)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))
     }
-
-
+    fn get_info(&self, id: u64) -> PyResult<(String, String)> {
+        get_info(&self.index_path, id)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))
+    }
 }
 
 #[pymodule]
